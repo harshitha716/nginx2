@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [deploy-prod]
+
 env:
   APP_NAME: pantheon
-  #GITHUB_ACTOR_SLACK: ${{ github.event.client_payload.github_actor }}
   NEW_TAG: ${{ github.event.client_payload.new_tag }}
 
 concurrency:
@@ -44,7 +44,6 @@ jobs:
           echo "K8S_NAMESPACE=pantheon" >> $GITHUB_OUTPUT
           echo "HELM_CHART_NAME=zamp-svc" >> $GITHUB_OUTPUT
           echo "HELM_REPOSITORY=zamp-dev-sg-helm-repository/zamp-svc" >> $GITHUB_OUTPUT
-          #echo "SLACK_WEBHOOK_URL=PRD_SLACK_WEBHOOK_URL" >> $GITHUB_OUTPUT
           echo "PRD_TRIGGER_TOKEN=PRD_TRIGGER_TOKEN" >> $GITHUB_OUTPUT
           echo "ENVIRONMENT=Production" >> $GITHUB_OUTPUT
           echo "APP_NAME=$APP_NAME" >> $GITHUB_OUTPUT
@@ -154,4 +153,3 @@ jobs:
               --wait \
               --timeout 10m0s \
               --create-namespace
-
