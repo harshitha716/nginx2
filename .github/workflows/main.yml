@@ -1,0 +1,157 @@
+name: Build and Deploy To Production
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [deploy-prod]
+env:
+  APP_NAME: pantheon
+  #GITHUB_ACTOR_SLACK: ${{ github.event.client_payload.github_actor }}
+  NEW_TAG: ${{ github.event.client_payload.new_tag }}
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  prepare-env:
+    name: Prepare Env
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      AWS_REGION: ${{ steps.vars.outputs.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ steps.vars.outputs.AWS_ACCOUNT_ID }}
+      BUILD_ENV: ${{ steps.vars.outputs.BUILD_ENV }}
+      PROJECT_PREFIX: ${{ steps.vars.outputs.PROJECT_PREFIX }}
+      K8S_CLUSTER: ${{ steps.vars.outputs.K8S_CLUSTER }}
+      K8S_NAMESPACE: ${{ steps.vars.outputs.K8S_NAMESPACE }}
+      HELM_CHART_NAME: ${{ steps.vars.outputs.HELM_CHART_NAME }}
+      HELM_REPOSITORY: ${{ steps.vars.outputs.HELM_REPOSITORY }}
+      APP_NAME: ${{ steps.vars.outputs.APP_NAME }}
+      SLACK_WEBHOOK_URL: ${{ steps.vars.outputs.SLACK_WEBHOOK_URL }}
+      ENVIRONMENT: ${{ steps.vars.outputs.ENVIRONMENT }}
+      STG_TRIGGER_TOKEN: ${{ github.event.client_payload.trigger_token }}
+      PRD_TRIGGER_TOKEN: ${{ steps.vars.outputs.TRIGGER_TOKEN }}
+      SSH_PRIVATE_KEY: ${{ steps.vars.outputs.SSH_PRIVATE_KEY }}
+    steps:
+      - id: vars
+        run: |
+          echo "AWS_REGION=us-east-2" >> $GITHUB_OUTPUT
+          echo "AWS_ACCOUNT_ID=842675998483" >> $GITHUB_OUTPUT
+          echo "BUILD_ENV=prd" >> $GITHUB_OUTPUT
+          echo "PROJECT_PREFIX=zamp-prd-sg" >> $GITHUB_OUTPUT
+          echo "K8S_CLUSTER=CI-CD" >> $GITHUB_OUTPUT
+          echo "K8S_NAMESPACE=pantheon" >> $GITHUB_OUTPUT
+          echo "HELM_CHART_NAME=zamp-svc" >> $GITHUB_OUTPUT
+          echo "HELM_REPOSITORY=zamp-dev-sg-helm-repository/zamp-svc" >> $GITHUB_OUTPUT
+          #echo "SLACK_WEBHOOK_URL=PRD_SLACK_WEBHOOK_URL" >> $GITHUB_OUTPUT
+          echo "PRD_TRIGGER_TOKEN=PRD_TRIGGER_TOKEN" >> $GITHUB_OUTPUT
+          echo "ENVIRONMENT=Production" >> $GITHUB_OUTPUT
+          echo "APP_NAME=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "SSH_PRIVATE_KEY=SSH_PRIVATE_KEY" >> $GITHUB_OUTPUT
+
+  build-push-image:
+    needs:
+      - prepare-env
+    name: Build and Push Image
+    permissions:
+      id-token: write
+      contents: read
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{needs.prepare-env.outputs.AWS_REGION}}
+      AWS_ACCOUNT_ID: ${{needs.prepare-env.outputs.AWS_ACCOUNT_ID}}
+      APP_NAME: ${{needs.prepare-env.outputs.APP_NAME}}
+      PROJECT_PREFIX: ${{needs.prepare-env.outputs.PROJECT_PREFIX}}
+      SSH_PRIVATE_KEY: ${{needs.prepare-env.outputs.SSH_PRIVATE_KEY}}
+    outputs:
+      IMAGE_TAG: ${{ steps.build.outputs.IMAGE_TAG }}
+      ECR_REPO: ${{ steps.build.outputs.ECR_REPO }}
+    steps:
+      - name: Checkout repository on : ${{ env.NEW_TAG }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{env.NEW_TAG}}
+
+      - id: 'auth'
+        name: 'Authenticate to AWS'
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: build
+        name: Build and Push Image
+        env:
+          ECR_REGISTRY: "${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+        run: |
+          ECR_REPO="${ECR_REGISTRY}/${PROJECT_PREFIX}-container-repo/${APP_NAME}"
+          IMAGE_TAG=$NEW_TAG
+          $(aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY)
+          docker build -t $ECR_REPO:$IMAGE_TAG --build-arg SSH_PRIVATE_KEY="${{secrets[env.SSH_PRIVATE_KEY]}}" .
+          docker push $ECR_REPO:$IMAGE_TAG
+          echo "ECR_REPO=$ECR_REPO" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy-to-k8s:
+    name: Deploy to K8s
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 15
+    needs:
+      - prepare-env
+      - build-push-image
+    env:
+      AWS_REGION: ${{needs.prepare-env.outputs.AWS_REGION}}
+      K8S_CLUSTER: ${{needs.prepare-env.outputs.K8S_CLUSTER}}
+      K8S_NAMESPACE: ${{needs.prepare-env.outputs.K8S_NAMESPACE}}
+      ECR_REPO: ${{needs.build-push-image.outputs.ECR_REPO}}
+      IMAGE_TAG: ${{needs.build-push-image.outputs.IMAGE_TAG}}
+      BUILD_ENV: ${{needs.prepare-env.outputs.BUILD_ENV}}
+    steps:
+      - name: Checkout repository on : ${{ env.NEW_TAG }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{env.NEW_TAG}}
+
+      - id: 'auth'
+        name: 'Authenticate to AWS'
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.7.2"
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.22.0"
+
+      - name: EKS config
+        uses: aws-actions/amazon-eks-actions@v1
+        with:
+          cluster-name: ${{ env.K8S_CLUSTER }}
+          region: ${{ env.AWS_REGION }}
+
+      - name: Deploy
+        run: |
+          helm repo add ${K8S_NAMESPACE}-repo https://${HELM_REPOSITORY} && helm repo update
+          helm upgrade --install ${APP_NAME} ${K8S_NAMESPACE}-repo/${HELM_CHART_NAME} \
+              --namespace ${K8S_NAMESPACE} \
+              --set default.image.repository="${ECR_REPO}" \
+              --set default.image.tag="${IMAGE_TAG}" \
+              --values helm/${BUILD_ENV}-values.yaml \
+              --wait \
+              --timeout 10m0s \
+              --create-namespace
+
